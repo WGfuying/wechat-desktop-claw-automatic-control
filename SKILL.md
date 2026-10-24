@@ -1,5 +1,6 @@
 ---
 name: 微信 PC 端自动控制
+displayName: 微信 PC 端自动控制
 description: 在 Windows 端通过 Windows-MCP 原生控制微信桌面端，向指定联系人发送消息、图片、文件（仅支持 Windows，暂无 macOS 版）。触发词：给某人发微信、打开微信发消息、微信发送、通过微信发给。也支持被其他 Skill 调用，实现自动化推送。
 version: 1.2.0
 author: 微光浮影
