@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微信桌面端自动化脚本
-功能：打开微信、搜索联系人、发送消息/图片/文件（支持批次多群聊一次进程完成）
+⚠️ 微信桌面端自动化脚本 ——【离线兼容备选】
+
+平台：仅支持 Windows（本 Skill 无 macOS 版）。
 依赖：pywinauto, pyperclip, pillow, pywin32
-微信路径：默认 C:/Program Files (x86)/Tencent/WeChat/WeChat.exe（如不同请在下方 WECHAT_PATH 修改）
+角色：本脚本是「离线兼容备选」，仅在【无 Windows-MCP 环境】时使用。
+      主流程请走 Windows-MCP（github.com/CursorTouch/Windows-MCP）原生控制，更稳定。
+
+功能：打开微信、搜索联系人、发送消息/图片/文件（支持批次多群聊一次进程完成）
+微信路径：D:/Tencent/Weixin/Weixin.exe（注意：是 Weixin 不是 WeChat）
 发送方式：Enter 键发送
-版本：1.1.0
+版本：1.2.0（备选层，随 Skill 主版本同步）
 
 ────────────────────────────────────────────────────────────
 针对 自主 Agent（Codex / WorkBuddy 等）驱动的适配要点：
@@ -36,6 +41,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 try:
     from pywinauto import Application
+    from pywinauto import findwindows
     from pywinauto.keyboard import send_keys
     import pyperclip
 except ImportError as e:
@@ -45,9 +51,12 @@ except ImportError as e:
 
 import ctypes
 
-WECHAT_PATH = "C:/Program Files (x86)/Tencent/WeChat/WeChat.exe"
+WECHAT_PATH = "D:/Tencent/Weixin/Weixin.exe"
 TIMEOUT = 20
 SW_RESTORE = 9
+# 微信主窗专属类名（Chromium 内核 UI）；另有 Qt 子窗也标题为「微信」，故必须锁定主窗类名，
+# 否则 uia connect 会因「2 个匹配」报 ElementAmbiguousError 而误判未运行、去乱拉实例
+MAIN_CLASS = "Chrome_WidgetWin_0"
 
 
 def log(msg):
@@ -63,22 +72,26 @@ def bring_to_foreground(hwnd):
         pass
 
 
+def main_window_of(app):
+    """取微信主窗（按主窗类名锁定，避开与 Qt 子窗的标题歧义）。"""
+    return app.window(title_re="微信", class_name=MAIN_CLASS)
+
+
 def launch_wechat():
     """启动微信（若已运行则直接连接），并稳妥还原到前台。
 
-    注意：本函数【绝不】关闭微信；即使微信已被收进托盘，
-    connect 仍可按标题匹配到隐藏窗口，再由 get_main_window 还原。
+    注意：本函数【绝不】关闭微信。
     """
-    # 先尝试连接已运行的微信（含托盘/最小化隐藏态）
+    # 优先连接已运行（含托盘还原后）的微信主窗口；连不上就拉起/还原
     try:
-        app = Application(backend='uia').connect(title_re="微信", timeout=3)
+        app = Application(backend='uia').connect(title_re="微信", class_name=MAIN_CLASS, timeout=10)
         log("微信已在运行，直接连接")
         return app
     except Exception:
         pass
 
-    # 启动微信
-    log("启动微信...")
+    # 微信在系统托盘/窗口不可枚举时，拉起可执行文件（单实例会还原主窗而非真重启）
+    log("启动/还原微信...")
     subprocess.Popen(WECHAT_PATH)
     time.sleep(6)
 
@@ -86,7 +99,7 @@ def launch_wechat():
     deadline = time.time() + TIMEOUT
     while time.time() < deadline:
         try:
-            app = Application(backend='uia').connect(title_re="微信", timeout=2)
+            app = Application(backend='uia').connect(title_re="微信", class_name=MAIN_CLASS, timeout=2)
             log("微信启动成功")
             return app
         except Exception:
@@ -100,7 +113,7 @@ def launch_wechat():
 def get_main_window(app):
     """获取微信主窗口，确保可见且在前台（含托盘还原）。"""
     try:
-        window = app.window(title_re="微信")
+        window = main_window_of(app)
         hwnd = window.handle
         bring_to_foreground(hwnd)
         time.sleep(0.6)
@@ -133,7 +146,7 @@ def ensure_window(app):
     不会关闭任何东西；若窗口被收进托盘则自动还原，若句柄丢失则重连。
     """
     try:
-        window = app.window(title_re="微信")
+        window = main_window_of(app)
         if not window.is_visible():
             bring_to_foreground(window.handle)
             time.sleep(0.4)
@@ -152,6 +165,43 @@ def ensure_window(app):
         return get_main_window(app)
 
 
+def ensure_logged_in(window):
+    """冷启动/掉登录会停在「进入微信」确认页；自动点掉绿钮并完成登录。
+
+    已登录（主界面）时登录钮不存在，函数静默返回。
+
+    关键点：
+      - 「进入微信」绿钮是微信自绘控件，uia 的 .click() 常常点不中，必须用 .click_input()
+        （真实移动鼠标并按下）才能触发。
+      - 登录后微信进入「正在进入」消息同步加载页，点完绿钮后固定等待同步即可。
+      - 不再依赖读取主界面文字判定就绪（微信聊天列表/搜索框是自绘控件，uia 读不到文字）。
+    """
+    # 是否处于登录确认页：找「进入微信/登录/进入」按钮
+    for label in ("进入微信", "登录", "进入"):
+        try:
+            btn = window.child_window(title=label, control_type="Button")
+            if btn.exists(timeout=1):
+                btn.click_input()
+                log(f"✅ 已点击「{label}」完成登录，等待消息同步…")
+                time.sleep(12)  # 消息同步加载（正在进入）需要时间
+                return True
+        except Exception:
+            continue
+    # 兜底：全树搜「进入微信」绿钮
+    try:
+        for ctrl in window.descendants(control_type="Button"):
+            if "进入微信" in (ctrl.window_text() or ""):
+                ctrl.click_input()
+                log("✅ 已点击「进入微信」完成登录，等待消息同步…")
+                time.sleep(12)
+                return True
+    except Exception:
+        pass
+    # 无登录钮 = 本来就是登录态
+    log("✅ 已处于登录态（无需登录）")
+    return True
+
+
 def search_contact(window, name):
     """搜索并选中联系人"""
     log(f"搜索联系人：{name}")
@@ -166,7 +216,10 @@ def search_contact(window, name):
     send_keys("^v")
     time.sleep(1.5)
 
-    # 按 Enter 选中第一个搜索结果
+    # 关键：微信搜索框直接回车会触发"搜一搜"联网搜索而非打开联系人；
+    # 需先用方向键把焦点移入结果列表、选中首个匹配的联系人，再回车打开
+    send_keys("{DOWN}")
+    time.sleep(0.6)
     send_keys("{ENTER}")
     time.sleep(1)
     log(f"已选中联系人：{name}")
@@ -305,6 +358,7 @@ def main():
     # 启动/连接微信（绝不关闭）
     app = launch_wechat()
     window = get_main_window(app)
+    ensure_logged_in(window)  # 冷启动/掉登录时自动点「进入微信」完成登录
 
     if args.launch_only:
         log("微信已启动，可以开始使用了")
